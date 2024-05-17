@@ -184,3 +184,82 @@ def compute_loss_forward(
          regularization_weight_tang*mean_tang_square_penalty)
 
     return (intensity_square_residual_sum, regularization_term)
+
+
+def rmsprop_optimize(
+    control_points_x: torch.Tensor, control_points_y: torch.Tensor, t_seq: torch.Tensor,
+    pixels_x: torch.Tensor, pixels_y: torch.Tensor, pixels_foreground_values: torch.Tensor,
+    f_star: float,
+    untrailed_unbinned_psf,
+    regularization_weight_norm: float, regularization_weight_tang: float,
+    numerical_integration_steps_number: int,
+    binning_grid_x: torch.Tensor, binning_grid_y: torch.Tensor,
+    max_epochs_number=1024, learning_rate=0.001, control_point_tolerance=0.001,
+    each_epoch_callback=lambda intensity_square_residual_sum, regularization_term: None
+):
+    '''
+    `control_points_x`,`control_points_y`:
+        size=(Q+1,); NO GRAD; to be optimized.
+    `t_seq`:
+        size=(Q+1,); no grad; an uniformly ascending float-type sequence, the time sequence of the control points.
+    `pixels_x`,`pixels_y`,pixels_foreground_values:
+        size=(pixels_number,); no grad.
+    `binning_grid_x`,`binning_grid_y`:
+        size=(β_x,β_y); no grad.
+    `untrailed_unbinned_psf`:
+        auto-grad functor (Δx,Δy) -> psf_values; `Δx`,`Δy`,`psf_values` share the same shape.
+        Do not wrap numpy.ndarray but torch.Tensor.
+    `numerical_integration_steps_number`:
+        `2N` in our paper, an even-positive integer; not giving an even-positive integer is an undefined behavior.
+
+    `max_epochs_number`:
+        max steps number of the optimizer; ≤0 ---- unlimited.
+    `control_point_tolerance`:
+        stop optimizing if none of the control points is moved by over `control_point_tolerance` in optimizer.step(); ≤0 ---- loop till `max_epochs_number`.
+
+    return (optimized_control_points_x,optimized_control_points_y); no grad
+    '''
+    control_points_x.requires_grad_(True)
+    control_points_y.requires_grad_(True)
+
+    tol2 = control_point_tolerance**2
+
+    optimizer = torch.optim.RMSprop(
+        [control_points_x, control_points_y],
+        lr=learning_rate
+    )
+
+    epoch = 0
+    while True:
+        if 0 < max_epochs_number <= epoch:
+            break
+
+        old_control_points_x = torch.detach(torch.clone(control_points_x))
+        old_control_points_y = torch.detach(torch.clone(control_points_y))
+
+        optimizer.zero_grad()
+        intensity_square_residual_sum, regularization_term = compute_loss_forward(
+            control_points_x, control_points_y, t_seq,
+            pixels_x, pixels_y, pixels_foreground_values,
+            f_star,
+            untrailed_unbinned_psf,
+            regularization_weight_norm, regularization_weight_tang,
+            numerical_integration_steps_number,
+            binning_grid_x, binning_grid_y)
+        each_epoch_callback(intensity_square_residual_sum, regularization_term)
+
+        loss = intensity_square_residual_sum+regularization_term
+        loss.backward()
+        optimizer.step()
+
+        if control_point_tolerance <= 0:
+            continue
+        delta_control_points_x = control_points_x-old_control_points_x
+        delta_control_points_y = control_points_y-old_control_points_y
+        delta_control_points_mag2 = delta_control_points_x**2+delta_control_points_y**2
+        if torch.max(delta_control_points_mag2) <= tol2:
+            break
+
+    control_points_x.requires_grad_(False)
+    control_points_y.requires_grad_(False)
+    return (control_points_x, control_points_y)
