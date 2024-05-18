@@ -1,6 +1,9 @@
 import torch
 
 
+PRIME_NUM_LIST = [3, 5, 7, 11, 19, 31, 59, 113, 223, 443, 883, 1765, 3527]
+
+
 def broadcast_stack(a: torch.Tensor, b: torch.Tensor):
     '''
     a: M_0×……×M_m
@@ -57,6 +60,61 @@ def grad2(seq: torch.Tensor):
     return seq[:-2]+seq[2:]-2*seq[1:-1]
 
 
+def locate(seq: torch.Tensor, data: torch.Tensor, inverse=False):
+    '''
+    `seq`:
+        non-decreasing 1-D array.
+
+    return:
+        inverse=False ---- size alike to `data`; how many element in the front of `seq` are smaller than `data`.
+        inverse=True ---- size alike to `data`; how many element in the rear of `seq` are greater than `data`.
+    '''
+    data = torch.unsqueeze(data, dim=0)
+
+    data, seq = broadcast_stack(data, seq)
+
+    if inverse:
+        where_data_lt_seq = data.lt(seq).int()
+        each_data_lt_seq_count = torch.sum(where_data_lt_seq, dim=-1)
+        result = each_data_lt_seq_count.squeeze(dim=0)
+    else:
+        where_data_gt_seq = data.gt(seq).int()
+        each_data_gt_seq_count = torch.sum(where_data_gt_seq, dim=-1)
+        result = each_data_gt_seq_count.squeeze(dim=0)
+    return result
+
+
+def piecewise_linear(control_points_x_or_y: torch.Tensor, t_seq: torch.Tensor, t: torch.Tensor):
+    '''
+    `control_points_x_or_y`,`t_seq`:
+        size=(Q+1,).
+    `t`:
+        any size.
+
+    return: `s(t)`; with the same shape as `t`.
+    '''
+    _2T = (t_seq[-1]-t_seq[0])
+    Q = t_seq.size()-1
+
+    x_curr = control_points_x_or_y[:-1]
+    x_next = control_points_x_or_y[1:]
+    _, x_curr = broadcast_stack(t, x_curr)
+    _, x_next = broadcast_stack(t, x_next)
+
+    t_curr = t_seq[:-1]
+    t_next = t_seq[1:]
+    _, t_curr = broadcast_stack(t, t_curr)
+    t, t_next = broadcast_stack(t, t_next)
+
+    delta_t_curr = t-t_curr
+    delta_t_next = t-t_next
+    gate = stepfunc(delta_t_curr)-stepfunc(delta_t_next)
+
+    gated_pieces = gate*(x_curr+delta_t_curr*(x_next-x_curr)*Q/_2T)
+    trajectory_x_or_y = torch.sum(gated_pieces, dim=-1)
+    return trajectory_x_or_y
+
+
 def compute_loss_forward(
     control_points_x: torch.Tensor, control_points_y: torch.Tensor, t_seq: torch.Tensor,
     pixels_x: torch.Tensor, pixels_y: torch.Tensor, pixels_foreground_values: torch.Tensor,
@@ -71,8 +129,8 @@ def compute_loss_forward(
         size=(Q+1,); grad required; to be optimized.
     `t_seq`:
         size=(Q+1,); no grad; an uniformly ascending float-type sequence, the time sequence of the control points.
-    `pixels_x`,`pixels_y`,pixels_foreground_values:
-        size=(pixels_number,); no grad.
+    `pixels_x`,`pixels_y`,`pixels_foreground_values`:
+        size=(pixels_number,); no grad; ROI pixels' coordinates and foreground values.
     `binning_grid_x`,`binning_grid_y`:
         size=(β_x,β_y); no grad.
     `untrailed_unbinned_psf`:
@@ -92,7 +150,7 @@ def compute_loss_forward(
 
     n = torch.arange(-N, N, 1)
     t = (n+0.5)*T/N
-    broadcast_shape = (2*N, Q)
+    broadcast_shape = (numerical_integration_steps_number, Q)
     t = torch.broadcast_to(torch.unsqueeze(t, dim=1),
                            broadcast_shape)
 
@@ -202,8 +260,8 @@ def rmsprop_optimize(
         size=(Q+1,); NO GRAD; to be optimized.
     `t_seq`:
         size=(Q+1,); no grad; an uniformly ascending float-type sequence, the time sequence of the control points.
-    `pixels_x`,`pixels_y`,pixels_foreground_values:
-        size=(pixels_number,); no grad.
+    `pixels_x`,`pixels_y`,`pixels_foreground_values`:
+        size=(pixels_number,); no grad; ROI pixels' coordinates and foreground values.
     `binning_grid_x`,`binning_grid_y`:
         size=(β_x,β_y); no grad.
     `untrailed_unbinned_psf`:
@@ -263,3 +321,216 @@ def rmsprop_optimize(
     control_points_x.requires_grad_(False)
     control_points_y.requires_grad_(False)
     return (control_points_x, control_points_y)
+
+
+def accumulate_along_trajectory(
+    control_points_x: torch.Tensor, control_points_y: torch.Tensor, t_seq: torch.Tensor,
+    pixels_x: torch.Tensor, pixels_y: torch.Tensor, pixels_foreground_values: torch.Tensor,
+    accumulative_steps_number: int
+):
+    '''
+    `control_points_x`,`control_points_y`:
+        size=(Q+1,).
+    `t_seq`:
+        size=(Q+1,); an uniformly ascending float-type sequence, the time sequence of the control points.
+    `pixels_x`,`pixels_y`,`pixels_foreground_values`:
+        size=(pixels_number,); no grad; ROI pixels' coordinates and foreground values.
+    `accumulative_steps_number`:
+        similar to `numerical_integration_steps_number`.
+
+    return (accu,accu_t_seq)
+        both size=(numerical_integration_steps_number+1,); the accumulations and corresponding time points [after 0 steps, after 1 steps, …, after `accumulative_steps_number` steps]
+    '''
+    T = (t_seq[-1]-t_seq[0])/2
+    N = accumulative_steps_number//2
+    n = torch.arange(-N, N, 1)
+    accu_t_seq = (n+0.5)*T/N
+
+    trajectory_x = piecewise_linear(control_points_x, t_seq, accu_t_seq)
+    trajectory_y = piecewise_linear(control_points_y, t_seq, accu_t_seq)
+    pixels_x, trajectory_x = broadcast_stack(pixels_x, trajectory_x)
+    pixels_y, trajectory_y = broadcast_stack(pixels_y, trajectory_y)
+    distance_x = pixels_x-trajectory_x
+    distance_y = pixels_y-trajectory_y
+    distance2 = distance_x**2+distance_y**2
+    which_closest = torch.argmin(distance2, dim=1)
+
+    accu = torch.zeros([accumulative_steps_number+1], dtype='float64')
+    accu[0] = 0.0
+    for step in range(accumulative_steps_number):
+        mask = which_closest.eq(step)
+        selected_pixels_foreground_values = torch.masked_select(
+            pixels_foreground_values, mask)
+        accu[step+1] = accu[step]+torch.sum(selected_pixels_foreground_values)
+    # for step in range(accumulative_steps_number)
+
+    # 强制矫正浮点计算导致的误差
+    F = torch.sum(pixels_foreground_values)
+    accu[-1] = F
+
+    return (accu, accu_t_seq)
+
+
+def refine_control_points(
+    control_points_x: torch.Tensor, control_points_y: torch.Tensor, t_seq: torch.Tensor,
+    pixels_x: torch.Tensor, pixels_y: torch.Tensor, pixels_foreground_values: torch.Tensor,
+    accumulative_steps_number: int
+):
+    '''
+    `control_points_x`,`control_points_y`:
+        size=(Q+1,).
+    `t_seq`:
+        size=(Q+1,); an uniformly ascending float-type sequence, the time sequence of the control points.
+    `pixels_x`,`pixels_y`,`pixels_foreground_values`:
+        size=(pixels_number,); ROI pixels' coordinates and foreground values.
+
+    return (new_control_points_x, new_control_points_y, new_t_seq)
+    '''
+    accu, accu_t_seq = accumulate_along_trajectory(
+        control_points_x, control_points_y, t_seq,
+        pixels_x, pixels_y, pixels_foreground_values,
+        accumulative_steps_number
+    )
+
+    old_control_points_number = t_seq.size()
+    old_control_points_number_gt_prime_count = locate(
+        PRIME_NUM_LIST, old_control_points_number)
+    new_control_points_number = PRIME_NUM_LIST[old_control_points_number_gt_prime_count+1]
+
+    flux_inc_seq = torch.linspace(0.0, accu[-1], new_control_points_number)
+    flux_inc_gt_count = locate(accu, flux_inc_seq, False)
+    flux_inc_lt_count = locate(accu, flux_inc_seq, True)
+    which_coincide = torch.add(flux_inc_gt_count, flux_inc_lt_count).lt(
+        accumulative_steps_number+1)
+    which_coincide = which_coincide.int()
+    flux_inc_ndx_in_accu_0 = flux_inc_gt_count-1+which_coincide
+    flux_inc_ndx_in_accu_1 = (accumulative_steps_number+1) - \
+        flux_inc_lt_count-which_coincide
+    new_control_points_at_which_time_points_in_old_trajectory_0 = accu_t_seq[
+        flux_inc_ndx_in_accu_0]
+    new_control_points_at_which_time_points_in_old_trajectory_1 = accu_t_seq[
+        flux_inc_ndx_in_accu_1]
+    new_control_points_x_0 = piecewise_linear(
+        control_points_x, t_seq, new_control_points_at_which_time_points_in_old_trajectory_0)
+    new_control_points_x_1 = piecewise_linear(
+        control_points_x, t_seq, new_control_points_at_which_time_points_in_old_trajectory_1)
+    new_control_points_y_0 = piecewise_linear(
+        control_points_y, t_seq, new_control_points_at_which_time_points_in_old_trajectory_0)
+    new_control_points_y_1 = piecewise_linear(
+        control_points_y, t_seq, new_control_points_at_which_time_points_in_old_trajectory_1)
+    new_control_points_x = (new_control_points_x_0+new_control_points_x_1)/2
+    new_control_points_y = (new_control_points_y_0+new_control_points_y_1)/2
+
+    ndx_left = 0
+    ndx_right = 0  # [,)
+    while True:  # disperse coinciding control points
+        if ndx_left >= new_control_points_number:
+            break
+        ndx_right = ndx_left+1
+        while True:  # find ndx_right
+            if ndx_right >= new_control_points_number:
+                break
+            if (new_control_points_x[ndx_right] != new_control_points_x[ndx_left] or
+                    new_control_points_y[ndx_right] != new_control_points_y[ndx_left]):
+                break
+            ndx_right += 1
+        win_size = ndx_right-ndx_left
+
+        # (,)
+        arange_ndx_left = ndx_left-1
+        arange_ndx_right = ndx_right
+
+        if arange_ndx_left < 0:  # dispersed to the right
+            arange_x = torch.linspace(
+                new_control_points_x[0],
+                new_control_points_x[arange_ndx_right],
+                win_size+1, True)
+            arange_y = torch.linspace(
+                new_control_points_y[0],
+                new_control_points_y[arange_ndx_right],
+                win_size+1, True)
+            new_control_points_x[ndx_left:ndx_right] = arange_x[:-1]
+            new_control_points_y[ndx_left:ndx_right] = arange_y[:-1]
+        elif arange_ndx_right >= new_control_points_number:  # dispersed to the left
+            arange_x = torch.linspace(
+                new_control_points_x[arange_ndx_left],
+                new_control_points_x[-1],
+                win_size+1, True)
+            arange_y = torch.linspace(
+                new_control_points_y[arange_ndx_left],
+                new_control_points_y[-1],
+                win_size+1, True)
+            new_control_points_x[ndx_left:ndx_right] = arange_x[1:]
+            new_control_points_y[ndx_left:ndx_right] = arange_y[1:]
+        else:  # dispersed to both sides
+            if win_size % 2 == 0:
+                # left half
+                arange_x_step = (
+                    new_control_points_x[ndx_left]-new_control_points_x[arange_ndx_left])*2/win_size
+                arange_y_step = (
+                    new_control_points_y[ndx_left]-new_control_points_y[arange_ndx_left])*2/win_size
+                arange_x = torch.arange(
+                    new_control_points_x[arange_ndx_left]+arange_x_step/2,
+                    new_control_points_x[ndx_left],
+                    arange_x_step)
+                arange_y = torch.arange(
+                    new_control_points_y[arange_ndx_left]+arange_y_step/2,
+                    new_control_points_y[ndx_left],
+                    arange_y_step)
+                new_control_points_x[ndx_left: ndx_left +
+                                     win_size//2] = arange_x
+                new_control_points_y[ndx_left: ndx_left +
+                                     win_size//2] = arange_y
+
+                # right half
+                arange_x_step = (
+                    new_control_points_x[arange_ndx_right]-new_control_points_x[ndx_left])*2/win_size
+                arange_y_step = (
+                    new_control_points_y[arange_ndx_right]-new_control_points_y[ndx_left])*2/win_size
+                arange_x = torch.arange(
+                    new_control_points_x[ndx_left]+arange_x_step/2,
+                    new_control_points_x[arange_ndx_right],
+                    arange_x_step)
+                arange_y = torch.arange(
+                    new_control_points_y[ndx_left]+arange_y_step/2,
+                    new_control_points_y[arange_ndx_right],
+                    arange_y_step)
+                new_control_points_x[ndx_left +
+                                     win_size//2: ndx_right] = arange_x
+                new_control_points_y[ndx_left + win_size //
+                                     2: ndx_right] = arange_y
+            else:  # win_size%2!=0
+                # left half
+                arange_x = torch.linspace(
+                    new_control_points_x[arange_ndx_left],
+                    new_control_points_x[ndx_left],
+                    win_size//2 + 2, True)
+                arange_y = torch.linspace(
+                    new_control_points_y[arange_ndx_left],
+                    new_control_points_y[ndx_left],
+                    win_size//2 + 2, True)
+                new_control_points_x[ndx_left: ndx_left +
+                                     win_size//2] = arange_x[1:-1]
+                new_control_points_y[ndx_left: ndx_left +
+                                     win_size//2] = arange_y[1:-1]
+
+                # right half
+                arange_x = torch.linspace(
+                    new_control_points_x[ndx_left],
+                    new_control_points_x[arange_ndx_right],
+                    win_size//2 + 2, True)
+                arange_y = torch.linspace(
+                    new_control_points_y[ndx_left],
+                    new_control_points_y[arange_ndx_right],
+                    win_size//2 + 2, True)
+                new_control_points_x[ndx_right - win_size //
+                                     2: ndx_right] = arange_x[1:-1]
+                new_control_points_y[ndx_right - win_size //
+                                     2: ndx_right] = arange_y[1:-1]
+
+        ndx_left = ndx_right
+    # disperse coinciding control points
+
+    new_t_seq = torch.linspace(t_seq[0], t_seq[-1], new_control_points_number)
+
+    return (new_control_points_x, new_control_points_y, new_t_seq)
