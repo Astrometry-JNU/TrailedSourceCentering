@@ -535,3 +535,75 @@ def refine_control_points(
     new_t_seq = torch.linspace(t_seq[0], t_seq[-1], new_control_points_number)
 
     return (new_control_points_x, new_control_points_y, new_t_seq)
+
+
+def main_loop(
+    control_points_x: torch.Tensor, control_points_y: torch.Tensor, t_seq: torch.Tensor,
+    pixels_x: torch.Tensor, pixels_y: torch.Tensor, pixels_foreground_values: torch.Tensor,
+    f_star: float,
+    untrailed_unbinned_psf,
+    regularization_weight_norm: float, regularization_weight_tang: float,
+    numerical_integration_steps_number: int,
+    binning_grid_x: torch.Tensor, binning_grid_y: torch.Tensor,
+    loop_exit_predicate,
+    max_epochs_number=1024, learning_rate=0.001, control_point_tolerance=0.001,
+    each_epoch_callback=lambda intensity_square_residual_sum, regularization_term: None,
+    control_points_number_seq=PRIME_NUM_LIST
+):
+    '''
+    `control_points_x`,`control_points_y`:
+        size=(Q+1,); NO GRAD; to be optimized.
+    `t_seq`:
+        size=(Q+1,); no grad; an uniformly ascending float-type sequence, the time sequence of the control points.
+    `pixels_x`,`pixels_y`,`pixels_foreground_values`:
+        size=(pixels_number,); no grad; ROI pixels' coordinates and foreground values.
+    `binning_grid_x`,`binning_grid_y`:
+        size=(β_x,β_y); no grad.
+    `untrailed_unbinned_psf`:
+        auto-grad functor (Δx,Δy) -> psf_values; `Δx`,`Δy`,`psf_values` share the same shape.
+        Do not wrap numpy.ndarray but torch.Tensor.
+    `numerical_integration_steps_number`:
+        `2N` in our paper, an even-positive integer; not giving an even-positive integer is an undefined behavior.
+
+    `loop_exit_predicate`:
+        functor (optimized_control_points_x,optimized_control_points_y,t_seq) -> bool;
+        return True  ---- exit the loop, and return current (optimized_control_points_x,optimized_control_points_y,t_seq);
+        return False ---- refine the control points, and continue looping.
+
+    `max_epochs_number`:
+        max steps number of the optimizer; ≤0 ---- unlimited.
+    `control_point_tolerance`:
+        stop optimizing if none of the control points is moved by over `control_point_tolerance` in optimizer.step(); ≤0 ---- loop till `max_epochs_number`.
+
+    return (optimized_control_points_x,optimized_control_points_y); no grad
+    '''
+
+    new_control_points_x, new_control_points_y, new_t_seq = refine_control_points(
+        control_points_x, control_points_y, t_seq,
+        pixels_x, pixels_y, pixels_foreground_values,
+        numerical_integration_steps_number,
+        control_points_number_seq)
+    control_points_x = piecewise_linear(new_control_points_x, t_seq)
+    control_points_y = piecewise_linear(new_control_points_y, t_seq)
+
+    while True:  # main loop
+        optimized_control_points_x, optimized_control_points_y = rmsprop_optimize(
+            control_points_x, control_points_y, t_seq,
+            pixels_x, pixels_y, pixels_foreground_values,
+            f_star,
+            untrailed_unbinned_psf,
+            regularization_weight_norm, regularization_weight_tang,
+            numerical_integration_steps_number,
+            binning_grid_x, binning_grid_y,
+            max_epochs_number, learning_rate, control_point_tolerance,
+            each_epoch_callback)
+        if loop_exit_predicate(optimized_control_points_x, optimized_control_points_y, t_seq):
+            break
+        control_points_x, control_points_y, t_seq = refine_control_points(
+            control_points_x, control_points_y, t_seq,
+            pixels_x, pixels_y, pixels_foreground_values,
+            numerical_integration_steps_number,
+            control_points_number_seq)
+    # main loop
+
+    return optimized_control_points_x, optimized_control_points_y, t_seq
