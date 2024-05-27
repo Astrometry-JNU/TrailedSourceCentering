@@ -374,7 +374,8 @@ def accumulate_along_trajectory(
 def refine_control_points(
     control_points_x: torch.Tensor, control_points_y: torch.Tensor, t_seq: torch.Tensor,
     pixels_x: torch.Tensor, pixels_y: torch.Tensor, pixels_foreground_values: torch.Tensor,
-    accumulative_steps_number: int
+    accumulative_steps_number: int,
+    control_points_number_seq=PRIME_NUM_LIST
 ):
     '''
     `control_points_x`,`control_points_y`:
@@ -394,8 +395,8 @@ def refine_control_points(
 
     old_control_points_number = t_seq.size()
     old_control_points_number_gt_prime_count = locate(
-        PRIME_NUM_LIST, old_control_points_number)
-    new_control_points_number = PRIME_NUM_LIST[old_control_points_number_gt_prime_count+1]
+        control_points_number_seq, old_control_points_number)
+    new_control_points_number = control_points_number_seq[old_control_points_number_gt_prime_count+1]
 
     flux_inc_seq = torch.linspace(0.0, accu[-1], new_control_points_number)
     flux_inc_gt_count = locate(accu, flux_inc_seq, False)
