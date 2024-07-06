@@ -1,7 +1,10 @@
 import torch
 
 
-PRIME_NUM_LIST = [3, 5, 7, 11, 19, 31, 59, 113, 223, 443, 883, 1765, 3527]
+PRIME_NUM_LIST = torch.tensor(
+    [3, 5, 7, 11, 19, 31, 59, 113, 223, 443, 883, 1765, 3527],
+    dtype=torch.int32
+)
 
 
 def broadcast_stack(a: torch.Tensor, b: torch.Tensor):
@@ -94,7 +97,9 @@ def piecewise_linear(control_points_x_or_y: torch.Tensor, t_seq: torch.Tensor, t
     return: `s(t)`; with the same shape as `t`.
     '''
     _2T = (t_seq[-1]-t_seq[0])
-    Q = t_seq.size()-1
+    Q = t_seq.size(dim=0)-1
+
+    endpointmask = torch.eq(t, t_seq[-1])
 
     x_curr = control_points_x_or_y[:-1]
     x_next = control_points_x_or_y[1:]
@@ -112,6 +117,10 @@ def piecewise_linear(control_points_x_or_y: torch.Tensor, t_seq: torch.Tensor, t
 
     gated_pieces = gate*(x_curr+delta_t_curr*(x_next-x_curr)*Q/_2T)
     trajectory_x_or_y = torch.sum(gated_pieces, dim=-1)
+
+    # fill the endpoint manually
+    trajectory_x_or_y[endpointmask] = control_points_x_or_y[-1]
+
     return trajectory_x_or_y
 
 
@@ -145,45 +154,14 @@ def compute_loss_forward(
     '''
     T = (t_seq[-1]-t_seq[0])/2
     N = numerical_integration_steps_number//2
-    Q = t_seq.size()-1
-    pixels_number = pixels_foreground_values.size()
+    Q = t_seq.size(dim=0)-1
+    pixels_number = pixels_foreground_values.size(dim=0)
 
     n = torch.arange(-N, N, 1)
     t = (n+0.5)*T/N
-    broadcast_shape = (numerical_integration_steps_number, Q)
-    t = torch.broadcast_to(torch.unsqueeze(t, dim=1),
-                           broadcast_shape)
 
-    t_seq_curr = t_seq[:-1]
-    t_seq_next = t_seq[1:]
-    t_seq_curr = torch.broadcast_to(torch.unsqueeze(
-        t_seq_curr, dim=0), broadcast_shape)
-    t_seq_next = torch.broadcast_to(torch.unsqueeze(
-        t_seq_next, dim=0), broadcast_shape)
-    delta_t = t-t_seq_curr
-    stepfunc_input_curr = delta_t
-    stepfunc_input_next = t-t_seq_next
-    gate_values = stepfunc(stepfunc_input_curr) - \
-        stepfunc(stepfunc_input_next)
-
-    x_curr = control_points_x[:-1]
-    y_curr = control_points_y[:-1]
-    x_next = control_points_x[1:]
-    y_next = control_points_x[1:]
-    x_curr = torch.broadcast_to(torch.unsqueeze(
-        x_curr, dim=0), broadcast_shape)
-    y_curr = torch.broadcast_to(torch.unsqueeze(
-        y_curr, dim=0), broadcast_shape)
-    x_next = torch.broadcast_to(torch.unsqueeze(
-        x_next, dim=0), broadcast_shape)
-    y_next = torch.broadcast_to(torch.unsqueeze(
-        y_next, dim=0), broadcast_shape)
-    piecewise_x = x_curr+delta_t*(x_next-x_curr)*Q/(2*T)
-    piecewise_y = y_curr+delta_t*(y_next-y_curr)*Q/(2*T)
-    gated_piecewise_x = gate_values*piecewise_x
-    gated_piecewise_y = gate_values*piecewise_y
-    traj_x = torch.sum(gated_piecewise_x, dim=1)
-    traj_y = torch.sum(gated_piecewise_y, dim=1)
+    traj_x = piecewise_linear(control_points_x, t_seq, t)
+    traj_y = piecewise_linear(control_points_y, t_seq, t)
 
     pixels_x, traj_x = broadcast_stack(
         pixels_x, traj_x)
@@ -253,7 +231,7 @@ def rmsprop_optimize(
     numerical_integration_steps_number: int,
     binning_grid_x: torch.Tensor, binning_grid_y: torch.Tensor,
     max_epochs_number=1024, learning_rate=0.001, control_point_tolerance=0.001,
-    each_epoch_callback=lambda intensity_square_residual_sum, regularization_term: None
+    each_epoch_callback=lambda epoch, control_points_x, control_points_y, intensity_square_residual_sum, regularization_term: None
 ):
     '''
     `control_points_x`,`control_points_y`:
@@ -304,7 +282,8 @@ def rmsprop_optimize(
             regularization_weight_norm, regularization_weight_tang,
             numerical_integration_steps_number,
             binning_grid_x, binning_grid_y)
-        each_epoch_callback(intensity_square_residual_sum, regularization_term)
+        each_epoch_callback(epoch, control_points_x, control_points_y,
+                            intensity_square_residual_sum, regularization_term)
 
         loss = intensity_square_residual_sum+regularization_term
         loss.backward()
@@ -317,6 +296,8 @@ def rmsprop_optimize(
         delta_control_points_mag2 = delta_control_points_x**2+delta_control_points_y**2
         if torch.max(delta_control_points_mag2) <= tol2:
             break
+
+        epoch += 1
 
     control_points_x.requires_grad_(False)
     control_points_y.requires_grad_(False)
@@ -339,12 +320,10 @@ def accumulate_along_trajectory(
         similar to `numerical_integration_steps_number`.
 
     return (accu,accu_t_seq)
-        both size=(numerical_integration_steps_number+1,); the accumulations and corresponding time points [after 0 steps, after 1 steps, …, after `accumulative_steps_number` steps]
+        both size=(accumulative_steps_number+1,); the accumulations and corresponding time points [after 0 steps, after 1 steps, …, after `accumulative_steps_number` steps]
     '''
-    T = (t_seq[-1]-t_seq[0])/2
-    N = accumulative_steps_number//2
-    n = torch.arange(-N, N, 1)
-    accu_t_seq = (n+0.5)*T/N
+    accu_t_seq = torch.linspace(
+        t_seq[0], t_seq[-1], accumulative_steps_number+1)
 
     trajectory_x = piecewise_linear(control_points_x, t_seq, accu_t_seq)
     trajectory_y = piecewise_linear(control_points_y, t_seq, accu_t_seq)
@@ -355,7 +334,7 @@ def accumulate_along_trajectory(
     distance2 = distance_x**2+distance_y**2
     which_closest = torch.argmin(distance2, dim=1)
 
-    accu = torch.zeros([accumulative_steps_number+1], dtype='float64')
+    accu = torch.zeros((accumulative_steps_number+1,), dtype=torch.float64)
     accu[0] = 0.0
     for step in range(accumulative_steps_number):
         mask = which_closest.eq(step)
@@ -366,6 +345,7 @@ def accumulate_along_trajectory(
 
     # 强制矫正浮点计算导致的误差
     F = torch.sum(pixels_foreground_values)
+    accu = torch.clip(accu, None, F)
     accu[-1] = F
 
     return (accu, accu_t_seq)
@@ -393,9 +373,9 @@ def refine_control_points(
         accumulative_steps_number
     )
 
-    old_control_points_number = t_seq.size()
+    old_control_points_number = t_seq.size(dim=0)
     old_control_points_number_gt_prime_count = locate(
-        control_points_number_seq, old_control_points_number)
+        control_points_number_seq, torch.tensor([old_control_points_number], dtype=torch.int32))[0]
     new_control_points_number = control_points_number_seq[old_control_points_number_gt_prime_count+1]
 
     flux_inc_seq = torch.linspace(0.0, accu[-1], new_control_points_number)
@@ -445,22 +425,22 @@ def refine_control_points(
             arange_x = torch.linspace(
                 new_control_points_x[0],
                 new_control_points_x[arange_ndx_right],
-                win_size+1, True)
+                win_size+1)
             arange_y = torch.linspace(
                 new_control_points_y[0],
                 new_control_points_y[arange_ndx_right],
-                win_size+1, True)
+                win_size+1)
             new_control_points_x[ndx_left:ndx_right] = arange_x[:-1]
             new_control_points_y[ndx_left:ndx_right] = arange_y[:-1]
         elif arange_ndx_right >= new_control_points_number:  # dispersed to the left
             arange_x = torch.linspace(
                 new_control_points_x[arange_ndx_left],
                 new_control_points_x[-1],
-                win_size+1, True)
+                win_size+1)
             arange_y = torch.linspace(
                 new_control_points_y[arange_ndx_left],
                 new_control_points_y[-1],
-                win_size+1, True)
+                win_size+1)
             new_control_points_x[ndx_left:ndx_right] = arange_x[1:]
             new_control_points_y[ndx_left:ndx_right] = arange_y[1:]
         else:  # dispersed to both sides
@@ -505,11 +485,11 @@ def refine_control_points(
                 arange_x = torch.linspace(
                     new_control_points_x[arange_ndx_left],
                     new_control_points_x[ndx_left],
-                    win_size//2 + 2, True)
+                    win_size//2 + 2)
                 arange_y = torch.linspace(
                     new_control_points_y[arange_ndx_left],
                     new_control_points_y[ndx_left],
-                    win_size//2 + 2, True)
+                    win_size//2 + 2)
                 new_control_points_x[ndx_left: ndx_left +
                                      win_size//2] = arange_x[1:-1]
                 new_control_points_y[ndx_left: ndx_left +
@@ -519,11 +499,11 @@ def refine_control_points(
                 arange_x = torch.linspace(
                     new_control_points_x[ndx_left],
                     new_control_points_x[arange_ndx_right],
-                    win_size//2 + 2, True)
+                    win_size//2 + 2)
                 arange_y = torch.linspace(
                     new_control_points_y[ndx_left],
                     new_control_points_y[arange_ndx_right],
-                    win_size//2 + 2, True)
+                    win_size//2 + 2)
                 new_control_points_x[ndx_right - win_size //
                                      2: ndx_right] = arange_x[1:-1]
                 new_control_points_y[ndx_right - win_size //
@@ -537,6 +517,17 @@ def refine_control_points(
     return (new_control_points_x, new_control_points_y, new_t_seq)
 
 
+def get_default_gaussian_psf_func(fwhn=1.29):
+    '''
+    return functor (delta_x:torch.Tensor, delta_y:torch.Tensor) -> psf_values
+    '''
+    sigma2 = ((fwhn**2) * 1.4426950408889634) / 4
+
+    def get_gaussian_psf(delta_x, delta_y):
+        return 0.5275796705272378*torch.exp(-(delta_x**2 + delta_y**2) / sigma2)
+    return get_gaussian_psf
+
+
 def main_loop(
     control_points_x: torch.Tensor, control_points_y: torch.Tensor, t_seq: torch.Tensor,
     pixels_x: torch.Tensor, pixels_y: torch.Tensor, pixels_foreground_values: torch.Tensor,
@@ -547,7 +538,7 @@ def main_loop(
     binning_grid_x: torch.Tensor, binning_grid_y: torch.Tensor,
     loop_exit_predicate,
     max_epochs_number=1024, learning_rate=0.001, control_point_tolerance=0.001,
-    each_epoch_callback=lambda intensity_square_residual_sum, regularization_term: None,
+    each_epoch_callback=lambda epoch, control_points_x, control_points_y, intensity_square_residual_sum, regularization_term: None,
     control_points_number_seq=PRIME_NUM_LIST
 ):
     '''
@@ -575,7 +566,7 @@ def main_loop(
     `control_point_tolerance`:
         stop optimizing if none of the control points is moved by over `control_point_tolerance` in optimizer.step(); ≤0 ---- loop till `max_epochs_number`.
 
-    return (optimized_control_points_x,optimized_control_points_y); no grad
+    return (optimized_control_points_x,optimized_control_points_y,refined_t_seq); no grad
     '''
 
     new_control_points_x, new_control_points_y, new_t_seq = refine_control_points(
@@ -583,8 +574,8 @@ def main_loop(
         pixels_x, pixels_y, pixels_foreground_values,
         numerical_integration_steps_number,
         control_points_number_seq)
-    control_points_x = piecewise_linear(new_control_points_x, t_seq)
-    control_points_y = piecewise_linear(new_control_points_y, t_seq)
+    control_points_x = piecewise_linear(new_control_points_x, new_t_seq, t_seq)
+    control_points_y = piecewise_linear(new_control_points_y, new_t_seq, t_seq)
 
     while True:  # main loop
         optimized_control_points_x, optimized_control_points_y = rmsprop_optimize(
@@ -600,7 +591,7 @@ def main_loop(
         if loop_exit_predicate(optimized_control_points_x, optimized_control_points_y, t_seq):
             break
         control_points_x, control_points_y, t_seq = refine_control_points(
-            control_points_x, control_points_y, t_seq,
+            optimized_control_points_x, optimized_control_points_y, t_seq,
             pixels_x, pixels_y, pixels_foreground_values,
             numerical_integration_steps_number,
             control_points_number_seq)
