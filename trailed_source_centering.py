@@ -87,6 +87,58 @@ def locate(seq: torch.Tensor, data: torch.Tensor, inverse=False):
     return result
 
 
+def bilinear(u: torch.Tensor, v: torch.Tensor, array: torch.Tensor):
+    """
+    Return the value of an array and its local gradient as interpolated at a
+    pair of non-integer coordinates (u,v). Works for entire array of input
+    coordinates. 
+
+    NOTE: Integer coordinates refer to the centers of pixels.
+
+    return tuple(
+        bilinear interpolated `array`[`u`,`v`], 
+        ∂`array`/∂`u` at [`u`,`v`], 
+        ∂`array`/∂`v` at [`u`,`v`], 
+        valid: a bool mask, with the same shape as `u` and `v`
+    )
+    """
+    shape = array.size()
+
+    # Define integer parts of indices and constrain to the shape of the array
+    ilo = torch.floor(u).clip(0, shape[0]-2).int()
+    jlo = torch.floor(v).clip(0, shape[1]-2).int()
+
+    ihi = ilo + 1
+    jhi = jlo + 1
+
+    # Get the fractional parts
+    ufrac0 = (u - ilo)
+    vfrac0 = (v - jlo)
+    ufrac1 = 1. - ufrac0
+    vfrac1 = 1. - vfrac0
+    valid = (ufrac0 >= 0.) & (ufrac0 <= 1.) & (vfrac0 >= 0.) & (vfrac1 <= 1.)
+
+    # Use bilinear interpolation on each array
+    f00 = array[ilo, jlo]
+    f01 = array[ilo, jhi]
+    f10 = array[ihi, jlo]
+    f11 = array[ihi, jhi]
+
+    f0v = f00 * vfrac1 + f01 * vfrac0
+    f1v = f10 * vfrac1 + f11 * vfrac0
+    fuv = f0v * ufrac1 + f1v * ufrac0
+
+    df_du_at_jlo = f10 - f00
+    df_du_at_jhi = f11 - f01
+    df_du_at_v = df_du_at_jlo * vfrac1 + df_du_at_jhi * vfrac0
+
+    df_dv_at_ilo = f01 - f00
+    df_dv_at_ihi = f11 - f10
+    df_dv_at_u = df_dv_at_ilo * ufrac1 + df_dv_at_ihi * ufrac0
+
+    return (fuv, df_du_at_v, df_dv_at_u, valid)
+
+
 def piecewise_linear(control_points_x_or_y: torch.Tensor, t_seq: torch.Tensor, t: torch.Tensor):
     '''
     `control_points_x_or_y`,`t_seq`:
@@ -517,15 +569,70 @@ def refine_control_points(
     return (new_control_points_x, new_control_points_y, new_t_seq)
 
 
-def get_default_gaussian_psf_func(fwhn=1.29):
+def get_simple_gaussian_psf_func(fwhn=1.29):
     '''
-    return functor (delta_x:torch.Tensor, delta_y:torch.Tensor) -> psf_values
+    return: auto-grad functor (Δx,Δy) -> psf_values; `Δx`,`Δy`,`psf_values` share the same shape.
     '''
     sigma2 = ((fwhn**2) * 1.4426950408889634) / 4
 
     def get_gaussian_psf(delta_x, delta_y):
-        return 0.5275796705272378*torch.exp(-(delta_x**2 + delta_y**2) / sigma2)
+        return torch.exp(-(delta_x**2 + delta_y**2) / sigma2)
     return get_gaussian_psf
+
+
+class PsfBilinearInterpolation(torch.autograd.Function):
+    @staticmethod
+    def transform_ls_to_ij(delta_x, delta_y, psf_array_center, psf_oversample):
+        '''
+        Δl,Δs: in 1×1 summation mode.
+        return (i,j)
+        '''
+        i = delta_x*psf_oversample+psf_array_center[0]
+        j = delta_y*psf_oversample+psf_array_center[1]
+        return (i, j)
+
+    @staticmethod
+    def transform_ij_to_ls(i, j, psf_array_center, psf_oversample):
+        '''
+        return (delta_x,delta_y) in 1×1 summation mode.
+        '''
+        delta_x = (i-psf_array_center[0])/psf_oversample
+        delta_y = (j-psf_array_center[1])/psf_oversample
+        return (delta_x, delta_y)
+
+    @staticmethod
+    def forward(ctx, delta_x, delta_y, psf_array, psf_array_center, psf_oversample):
+        u, v = PsfBilinearInterpolation.transform_ls_to_ij(
+            delta_x, delta_y, psf_array_center, psf_oversample)
+        psf_values, dpsf_du, dpsf_dv, _ = bilinear(u, v, psf_array)
+        dpsf_dl = dpsf_du*psf_oversample
+        dpsf_ds = dpsf_dv*psf_oversample
+        ctx.save_for_backward(dpsf_dl, dpsf_ds)
+        return psf_values
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        dpsf_dl, dpsf_ds = ctx.saved_tensors
+        droot_dl = torch.mul(grad_output, dpsf_dl)
+        droot_ds = torch.mul(grad_output, dpsf_ds)
+        return droot_dl, droot_ds, None, None, None
+# class PsfBilinearInterpolation
+
+
+def interpolate_psf_bilinear(delta_x, delta_y, psf_array, psf_array_center, psf_oversample):
+    '''
+    Only `delta_x`,`delta_y` require grad.
+    '''
+    return PsfBilinearInterpolation.apply(delta_x, delta_y, psf_array, psf_array_center, psf_oversample)
+
+
+def wrap_psf_functor(psf_array, psf_array_center, psf_oversample):
+    '''
+    return: auto-grad functor (Δx,Δy) -> psf_values; `Δx`,`Δy`,`psf_values` share the same shape.
+    '''
+    def _psf(delta_x, delta_y):
+        return interpolate_psf_bilinear(delta_x, delta_y, psf_array, psf_array_center, psf_oversample)
+    return _psf
 
 
 def main_loop(
