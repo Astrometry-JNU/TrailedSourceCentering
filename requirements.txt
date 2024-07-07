@@ -1,0 +1,4 @@
+# PyTorch (CPU)
+torch
+torchvision
+torchaudio
