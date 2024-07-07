@@ -1,5 +1,30 @@
 [![CC BY 4.0][cc-by-shield]][cc-by]
 
+# Installation
+
+- The code is written in *Python 3.11*.
+
+    Create a conda env if necessary.
+
+    ```
+    conda create -n YOUR_ENV_NAME python=3.11
+    ```
+
+- Install latest *PyTorch* if necessary
+
+    ```
+    pip install -r requirements.txt
+    ```
+
+- Install *trailed-source-centering*
+
+    In current directory,
+    ```
+    python setup.py install
+    ```
+
+# License
+
 This software is licensed under a
 [Creative Commons Attribution 4.0 International License][cc-by].
 
